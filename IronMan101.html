@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Holographic Hand Interface</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        /* The webcam feed */
+        #video_container {
+            position: absolute;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            z-index: -1;
+        }
+        
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* Mirror view */
+        }
+
+        /* Three.js Canvas */
+        canvas {
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        /* UI Overlay */
+        #ui {
+            position: absolute;
+            top: 30px;
+            left: 30px;
+            color: #00f2ff;
+            pointer-events: none;
+            text-shadow: 0 0 10px rgba(0, 242, 255, 0.5);
+            letter-spacing: 1px;
+        }
+
+        .status-pill {
+            display: inline-block;
+            padding: 5px 12px;
+            background: rgba(0, 40, 60, 0.6);
+            border: 1px solid #00f2ff;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+
+        #loading-screen {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: #000;
+            color: #00f2ff;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid rgba(0, 242, 255, 0.2);
+            border-top: 3px solid #00f2ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        #instructions {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px 20px;
+            border-radius: 10px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading-screen">
+        <div class="spinner"></div>
+        <div>INITIALIZING NEURAL LINK...</div>
+    </div>
+
+    <div id="ui">
+        <h1 style="margin:0; font-weight: 300;">HOLO-LINK <span style="font-size: 15px; vertical-align: middle; opacity: 0.7;">v4.2</span></h1>
+        <div id="hand-count" class="status-pill">SEARCHING FOR HANDS...</div>
+    </div>
+
+    <div id="instructions">
+        <b>PINCH</b> (Thumb + Index) to grab & move • <b>TWO HAND PINCH</b> to scale • <b>RELEASE</b> to throw
+    </div>
+
+    <div id="video_container">
+        <video id="input_video" autoplay playsinline></video>
+    </div>
+
+    <!-- Dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- CONSTANTS & STATE ---
+        const PINCH_THRESHOLD = 0.04; 
+        const objects = [];
+        let grabbedObject = null;
+        let secondaryGrabbedObject = null; // For two-hand scaling
+        let initialScaleDist = 0;
+        let initialObjectScale = new THREE.Vector3();
+
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 10;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+        const pointLight = new THREE.PointLight(0x00f2ff, 150);
+        pointLight.position.set(5, 5, 5);
+        scene.add(pointLight);
+
+        // --- BACKGROUND PARTICLES ---
+        const partGeo = new THREE.BufferGeometry();
+        const partPos = new Float32Array(2000 * 3);
+        for(let i=0; i<6000; i++) partPos[i] = (Math.random() - 0.5) * 40;
+        partGeo.setAttribute('position', new THREE.BufferAttribute(partPos, 3));
+        const particles = new THREE.Points(partGeo, new THREE.PointsMaterial({ color: 0x00f2ff, size: 0.05, transparent: true, opacity: 0.4 }));
+        scene.add(particles);
+
+        // --- INTERACTIVE OBJECTS ---
+        const geometries = [
+            new THREE.BoxGeometry(1.5, 1.5, 1.5),
+            new THREE.IcosahedronGeometry(1.2, 0),
+            new THREE.TorusGeometry(1, 0.3, 16, 32)
+        ];
+
+        for (let i = 0; i < 6; i++) {
+            const mat = new THREE.MeshPhongMaterial({
+                color: 0x0088ff,
+                emissive: 0x002244,
+                transparent: true,
+                opacity: 0.7,
+                shininess: 100
+            });
+            const mesh = new THREE.Mesh(geometries[i % geometries.length], mat);
+            mesh.position.set((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 8, (Math.random() - 0.5) * 5);
+            
+            mesh.userData = {
+                velocity: new THREE.Vector3(),
+                rotVelocity: new THREE.Vector3(Math.random()*0.02, Math.random()*0.02, 0),
+                isGrabbed: false,
+                targetId: null // Stores which hand is holding it
+            };
+            
+            scene.add(mesh);
+            objects.push(mesh);
+        }
+
+        // --- HAND VISUALIZER ---
+        const createHandModel = () => {
+            const group = new THREE.Group();
+            const jointMat = new THREE.MeshBasicMaterial({ color: 0x00f2ff });
+            const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+            const joints = [];
+            for(let i=0; i<21; i++) {
+                const j = new THREE.Mesh(new THREE.SphereGeometry(0.1), jointMat);
+                joints.push(j);
+                group.add(j);
+            }
+            const lines = [];
+            const connections = [[0,1,2,3,4], [0,5,6,7,8], [5,9,10,11,12], [9,13,14,15,16], [13,17,18,19,20], [0,17]];
+            connections.forEach(() => {
+                const g = new THREE.BufferGeometry();
+                const l = new THREE.Line(g, lineMat);
+                lines.push({ line: l, indices: [] });
+                group.add(l);
+            });
+            scene.add(group);
+            return { group, joints, lines, connections };
+        };
+
+        const handModels = [createHandModel(), createHandModel()];
+
+        // --- INTERACTION UTILS ---
+        const raycaster = new THREE.Raycaster();
+        
+        function getPinch(landmarks) {
+            const thumb = landmarks[4];
+            const index = landmarks[8];
+            const dx = thumb.x - index.x;
+            const dy = thumb.y - index.y;
+            const dz = thumb.z - index.z;
+            return Math.sqrt(dx*dx + dy*dy + dz*dz);
+        }
+
+        function mapToScene(lm) {
+            // Converts MediaPipe 0-1 to Three.js space
+            // Mirror X because video is mirrored
+            const x = (1 - lm.x) * 2 - 1;
+            const y = -(lm.y * 2 - 1);
+            
+            // Unproject into world space
+            const vector = new THREE.Vector3(x, y, 0.5);
+            vector.unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const distance = -camera.position.z / dir.z + (lm.z * -10); // Use MP depth for relative Z
+            return camera.position.clone().add(dir.multiplyScalar(distance));
+        }
+
+        // --- MEDIAPIPE LOGIC ---
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults((results) => {
+            document.getElementById('loading-screen').style.display = 'none';
+            
+            const handCountUI = document.getElementById('hand-count');
+            handModels.forEach(m => m.group.visible = false);
+            
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                handCountUI.innerText = `${results.multiHandLandmarks.length} HANDS CONNECTED`;
+                
+                results.multiHandLandmarks.forEach((landmarks, hIdx) => {
+                    const model = handModels[hIdx];
+                    model.group.visible = true;
+
+                    // Update Hand Visuals
+                    const worldJoints = landmarks.map(lm => mapToScene(lm));
+                    worldJoints.forEach((pos, jIdx) => {
+                        model.joints[jIdx].position.copy(pos);
+                    });
+
+                    model.connections.forEach((indices, lIdx) => {
+                        const pts = indices.map(i => worldJoints[i]);
+                        model.lines[lIdx].line.geometry.setFromPoints(pts);
+                    });
+
+                    // Interaction Logic
+                    const indexTip = worldJoints[8];
+                    const isPinching = getPinch(landmarks) < PINCH_THRESHOLD;
+
+                    // Target detection (Raycasting)
+                    const screenX = (1 - landmarks[8].x) * 2 - 1;
+                    const screenY = -(landmarks[8].y * 2 - 1);
+                    raycaster.setFromCamera({ x: screenX, y: screenY }, camera);
+                    const intersects = raycaster.intersectObjects(objects);
+
+                    // Visualize target
+                    objects.forEach(obj => {
+                        if(!obj.userData.isGrabbed) obj.material.emissive.setHex(0x002244);
+                    });
+                    if(intersects.length > 0 && !isPinching) {
+                        intersects[0].object.material.emissive.setHex(0x005588);
+                    }
+
+                    // Grab Logic
+                    const myGrabbed = objects.find(o => o.userData.isGrabbed && o.userData.targetId === hIdx);
+
+                    if (isPinching) {
+                        if (!myGrabbed && intersects.length > 0 && !intersects[0].object.userData.isGrabbed) {
+                            // Initial Grab
+                            const obj = intersects[0].object;
+                            obj.userData.isGrabbed = true;
+                            obj.userData.targetId = hIdx;
+                            obj.material.emissive.setHex(0x00ffff);
+                        } else if (myGrabbed) {
+                            // Moving Grabbed Object
+                            const prevPos = myGrabbed.position.clone();
+                            myGrabbed.position.lerp(indexTip, 0.2);
+                            
+                            // Physics: Velocity = Delta Pos
+                            myGrabbed.userData.velocity.copy(myGrabbed.position).sub(prevPos);
+
+                            // Scaling Logic (if 2 hands are pinching the same object)
+                            // Note: For simplicity in this demo, we check if 2 hands are pinching ANY objects
+                            if (results.multiHandLandmarks.length === 2) {
+                                const otherHandPinch = getPinch(results.multiHandLandmarks[1 - hIdx]) < PINCH_THRESHOLD;
+                                if (otherHandPinch) {
+                                    const handA = worldJoints[8];
+                                    const handB = mapToScene(results.multiHandLandmarks[1 - hIdx][8]);
+                                    const currentDist = handA.distanceTo(handB);
+                                    
+                                    if (initialScaleDist === 0) {
+                                        initialScaleDist = currentDist;
+                                        initialObjectScale.copy(myGrabbed.scale);
+                                    } else {
+                                        const ratio = currentDist / initialScaleDist;
+                                        const s = THREE.MathUtils.clamp(initialObjectScale.x * ratio, 0.2, 5);
+                                        myGrabbed.scale.set(s, s, s);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Release
+                        if (myGrabbed) {
+                            myGrabbed.userData.isGrabbed = false;
+                            myGrabbed.userData.targetId = null;
+                            myGrabbed.material.emissive.setHex(0x002244);
+                            initialScaleDist = 0;
+                        }
+                    }
+                });
+            } else {
+                handCountUI.innerText = "SEARCHING FOR HANDS...";
+            }
+        });
+
+        // --- CAMERA SETUP ---
+        const videoElement = document.getElementById('input_video');
+        const camMP = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+        camMP.start();
+
+        // --- ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            particles.rotation.y += 0.001;
+
+            objects.forEach(obj => {
+                if (!obj.userData.isGrabbed) {
+                    // Physics
+                    obj.position.add(obj.userData.velocity);
+                    obj.rotation.x += obj.userData.rotVelocity.x;
+                    obj.rotation.y += obj.userData.rotVelocity.y;
+
+                    // Damping
+                    obj.userData.velocity.multiplyScalar(0.96);
+                    
+                    // Idle drift if slow
+                    if(obj.userData.velocity.length() < 0.01) {
+                        obj.position.y += Math.sin(Date.now() * 0.001 + obj.id) * 0.002;
+                    }
+
+                    // Containment
+                    if (Math.abs(obj.position.x) > 15) obj.userData.velocity.x *= -1;
+                    if (Math.abs(obj.position.y) > 10) obj.userData.velocity.y *= -1;
+                    if (Math.abs(obj.position.z) > 10) obj.userData.velocity.z *= -1;
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
